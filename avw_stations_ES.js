@@ -209,8 +209,8 @@ const station_data = {
     ESOK: {
         name: 'Karlstad Airport',
         icao: 'ESOK',
-        lat: 59.45,
-        lon: 13.3333333333333,
+        lat: 59.444722,
+        lon: 13.337500,
         elev: 0.107,
         country: 'SE',
         metar: 'X',
@@ -407,8 +407,8 @@ const station_data = {
     ESST: {
         name: 'Torsby Airport',
         icao: 'ESST',
-        lat: 60.15,
-        lon: 12.9833333333333,
+        lat: 60.154722,
+        lon: 12.994444,
         elev: 0.12,
         country: 'SE',
         metar: 'X',
