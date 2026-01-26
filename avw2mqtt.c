@@ -384,23 +384,31 @@ static void format_sky(char *out, size_t sz, xmlNode *node) {
     int found = 0;
     for (xmlNode *n = node->children; n; n = n->next) {
         if (n->type == XML_ELEMENT_NODE && !strcmp((char *)n->name, "sky_condition")) {
-            if (!found) {
-                append(out, sz, "Sky ");
-                found = 1;
-            }
             char *cover = xml_attr(n, "sky_cover");
             char *base = xml_attr(n, "cloud_base_ft_agl");
             if (cover) {
-                if (!strcmp(cover, "CLR") || !strcmp(cover, "SKC"))
-                    append(out, sz, "clear");
+                const char *cover_txt = NULL;
+                if (!strcmp(cover, "CLR") || !strcmp(cover, "SKC") || !strcmp(cover, "NCD"))
+                    cover_txt = "clear";
+                else if (!strcmp(cover, "CAVOK"))
+                    cover_txt = "okay";
+                else if (!strcmp(cover, "NSC"))
+                    cover_txt = "insignificant";
                 else if (!strcmp(cover, "FEW"))
-                    append(out, sz, "few");
+                    cover_txt = "few";
                 else if (!strcmp(cover, "SCT"))
-                    append(out, sz, "scattered");
+                    cover_txt = "scattered";
                 else if (!strcmp(cover, "BKN"))
-                    append(out, sz, "broken");
+                    cover_txt = "broken";
                 else if (!strcmp(cover, "OVC"))
-                    append(out, sz, "overcast");
+                    cover_txt = "overcast";
+                else
+                    continue;
+                if (!found) {
+                    append(out, sz, "Sky ");
+                    found = 1;
+                }
+                append(out, sz, cover_txt);
                 if (base && strcmp(cover, "CLR") && strcmp(cover, "SKC"))
                     append(out, sz, " %sft", base);
                 append(out, sz, ", ");
