@@ -321,6 +321,13 @@ static void append(char *buf, size_t bufsz, const char *fmt, ...) {
     vsnprintf(buf + len, bufsz - len, fmt, ap);
     va_end(ap);
 }
+static void format_time(char *out, size_t sz, const char *iso) {
+    struct tm tm = {0};
+    if (sscanf(iso, "%d-%d-%dT%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min) == 5) {
+        static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        snprintf(out, sz, "%d %s %02d%02dZ", tm.tm_mday, months[tm.tm_mon - 1], tm.tm_hour, tm.tm_min);
+    }
+}
 static void format_wind(char *out, size_t sz, xmlNode *node) {
     char *dir = xml_text(node, "wind_dir_degrees");
     char *spd = xml_text(node, "wind_speed_kt");
@@ -380,42 +387,105 @@ static void format_wx(char *out, size_t sz, xmlNode *node) {
         append(out, sz, " showers");
     if (strstr(wx, "FZ"))
         append(out, sz, " freezing");
+    if (strstr(wx, "MI"))
+        append(out, sz, " shallow");
+    if (strstr(wx, "BC"))
+        append(out, sz, " patches");
+    if (strstr(wx, "PR"))
+        append(out, sz, " partial");
+    if (strstr(wx, "DR"))
+        append(out, sz, " drifting");
+    if (strstr(wx, "BL"))
+        append(out, sz, " blowing");
+    if (strstr(wx, "PL"))
+        append(out, sz, " ice pellets");
+    if (strstr(wx, "GR"))
+        append(out, sz, " hail");
+    if (strstr(wx, "GS"))
+        append(out, sz, " small hail");
+    if (strstr(wx, "SG"))
+        append(out, sz, " snow grains");
+    if (strstr(wx, "IC"))
+        append(out, sz, " ice crystals");
+    if (strstr(wx, "UP"))
+        append(out, sz, " unknown precip");
+    if (strstr(wx, "VA"))
+        append(out, sz, " volcanic ash");
+    if (strstr(wx, "DU"))
+        append(out, sz, " dust");
+    if (strstr(wx, "SA"))
+        append(out, sz, " sand");
+    if (strstr(wx, "PY"))
+        append(out, sz, " spray");
+    if (strstr(wx, "PO"))
+        append(out, sz, " dust whirls");
+    if (strstr(wx, "SQ"))
+        append(out, sz, " squalls");
+    if (strstr(wx, "FC"))
+        append(out, sz, " funnel cloud");
+    if (strstr(wx, "SS"))
+        append(out, sz, " sandstorm");
+    if (strstr(wx, "DS"))
+        append(out, sz, " duststorm");
+    if (strstr(wx, "VC"))
+        append(out, sz, " in vicinity");
     append(out, sz, "; ");
 }
 static void format_sky(char *out, size_t sz, xmlNode *node) {
     int found = 0;
+    char *vv = xml_text(node, "vert_vis_ft");
+    if (vv) {
+        append(out, sz, "Sky obscured, vertical visibility %sft; ", vv);
+        return;
+    }
     for (xmlNode *n = node->children; n; n = n->next) {
-        if (n->type == XML_ELEMENT_NODE && !strcmp((char *)n->name, "sky_condition")) {
-            char *cover = xml_attr(n, "sky_cover");
-            char *base = xml_attr(n, "cloud_base_ft_agl");
-            if (cover) {
-                const char *cover_txt = NULL;
-                if (!strcmp(cover, "CLR") || !strcmp(cover, "SKC") || !strcmp(cover, "NCD"))
-                    cover_txt = "clear";
-                else if (!strcmp(cover, "CAVOK"))
-                    cover_txt = "okay";
-                else if (!strcmp(cover, "NSC"))
-                    cover_txt = "insignificant";
-                else if (!strcmp(cover, "FEW"))
-                    cover_txt = "few";
-                else if (!strcmp(cover, "SCT"))
-                    cover_txt = "scattered";
-                else if (!strcmp(cover, "BKN"))
-                    cover_txt = "broken";
-                else if (!strcmp(cover, "OVC"))
-                    cover_txt = "overcast";
-                else
-                    continue;
-                if (!found) {
-                    append(out, sz, "Sky ");
-                    found = 1;
-                }
-                append(out, sz, cover_txt);
-                if (base && strcmp(cover, "CLR") && strcmp(cover, "SKC"))
-                    append(out, sz, " %sft", base);
-                append(out, sz, ", ");
-            }
+        if (n->type != XML_ELEMENT_NODE || strcmp((char *)n->name, "sky_condition"))
+            continue;
+        char *cover = xml_attr(n, "sky_cover");
+        if (!cover)
+            continue;
+        const char *cover_txt = NULL;
+        int has_base = 1;
+        if (!strcmp(cover, "CLR") || !strcmp(cover, "SKC")) {
+            cover_txt = "clear";
+            has_base = 0;
+        } else if (!strcmp(cover, "NCD")) {
+            cover_txt = "no cloud detected";
+            has_base = 0;
+        } else if (!strcmp(cover, "NSC")) {
+            cover_txt = "no significant cloud";
+            has_base = 0;
+        } else if (!strcmp(cover, "CAVOK")) {
+            cover_txt = "CAVOK";
+            has_base = 0;
+        } else if (!strcmp(cover, "VV"))
+            cover_txt = "vertical visibility";
+        else if (!strcmp(cover, "FEW"))
+            cover_txt = "few";
+        else if (!strcmp(cover, "SCT"))
+            cover_txt = "scattered";
+        else if (!strcmp(cover, "BKN"))
+            cover_txt = "broken";
+        else if (!strcmp(cover, "OVC"))
+            cover_txt = "overcast";
+        else
+            continue;
+        if (!found) {
+            append(out, sz, "Sky ");
+            found = 1;
         }
+        append(out, sz, "%s", cover_txt);
+        char *base = xml_attr(n, "cloud_base_ft_agl");
+        if (base && has_base)
+            append(out, sz, " %sft", base);
+        char *cloud_type = xml_attr(n, "cloud_type");
+        if (cloud_type) {
+            if (!strcmp(cloud_type, "CB"))
+                append(out, sz, " CB");
+            else if (!strcmp(cloud_type, "TCU"))
+                append(out, sz, " TCU");
+        }
+        append(out, sz, ", ");
     }
     if (found) {
         out[strlen(out) - 2] = ';';
@@ -435,16 +505,30 @@ static void format_press(char *out, size_t sz, xmlNode *node) {
     if (altim)
         append(out, sz, "QNH %d hPa; ", (int)(0.5 + 33.8639 * atof(altim)));
 }
+static void format_forecast_time(char *out, size_t sz, xmlNode *node) {
+    char *from = xml_text(node, "fcst_time_from");
+    char *to = xml_text(node, "fcst_time_to");
+    char tf[32] = "", tt[32] = "";
+    if (from)
+        format_time(tf, sizeof(tf), from);
+    if (to)
+        format_time(tt, sizeof(tt), to);
+    append(out, sz, "%s-%s ", tf, tt);
+}
 static void format_category(char *out, size_t sz, xmlNode *node) {
     char *cat = xml_text(node, "flight_category");
     if (cat)
         append(out, sz, "Category %s; ", cat);
 }
-static void format_time(char *out, size_t sz, const char *iso) {
-    struct tm tm = {0};
-    if (sscanf(iso, "%d-%d-%dT%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min) == 5) {
-        static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-        snprintf(out, sz, "%d %s %02d%02dZ", tm.tm_mday, months[tm.tm_mon - 1], tm.tm_hour, tm.tm_min);
+static void format_change(char *out, size_t sz, xmlNode *node) {
+    char *change = xml_text(node, "change_indicator");
+    if (change) {
+        if (!strcmp(change, "FM"))
+            append(out, sz, "FROM ");
+        else if (!strcmp(change, "BECMG"))
+            append(out, sz, "BECOMING ");
+        else
+            append(out, sz, "%s ", change);
     }
 }
 static void format_end(char *out, size_t sz) {
@@ -537,26 +621,16 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
         snprintf(text, sizeof(text), "TAF for %s issued %s valid %s to %s\n", icao, t1, t2, t3);
     }
 
-    for (xmlNode *fc = taf->children; fc; fc = fc->next) {
+    for (xmlNode *fc = taf->children; fc; fc = fc->next)
         if (fc->type == XML_ELEMENT_NODE && !strcmp((char *)fc->name, "forecast")) {
-            char *from = xml_text(fc, "fcst_time_from");
-            char *to = xml_text(fc, "fcst_time_to");
-            char *change = xml_text(fc, "change_indicator");
-            char tf[32] = "", tt[32] = "";
-            if (from)
-                format_time(tf, sizeof(tf), from);
-            if (to)
-                format_time(tt, sizeof(tt), to);
-            if (change)
-                append(text, sizeof(text), "%s ", change);
-            append(text, sizeof(text), "%s-%s ", tf, tt);
+            format_forecast_time(text, sizeof(text), fc);
+            format_change(text, sizeof(text), fc);
             format_wind(text, sizeof(text), fc);
             format_vis(text, sizeof(text), fc);
             format_wx(text, sizeof(text), fc);
             format_sky(text, sizeof(text), fc);
             format_end(text, sizeof(text));
         }
-    }
 
     // printf("TAF: %s\n", text);
     cJSON *json = cJSON_CreateObject();
