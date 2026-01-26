@@ -360,6 +360,8 @@ static void format_wx(char *out, size_t sz, xmlNode *node) {
         append(out, sz, " light");
     if (wx[0] == '+')
         append(out, sz, " heavy");
+    if (strstr(wx, "NSW"))
+        append(out, sz, " insignificant");
     if (strstr(wx, "RA"))
         append(out, sz, " rain");
     if (strstr(wx, "SN"))
@@ -481,6 +483,7 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
     if (flight_cat)
         append(text, sizeof(text), "; Category %s", flight_cat);
 
+    // printf("METAR: %s\n", text);
     cJSON *json = cJSON_CreateObject();
     char *raw = xml_text(metar, "raw_text");
     if (raw)
@@ -545,6 +548,7 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
         }
     }
 
+    // printf("TAF: %s\n", text);
     cJSON *json = cJSON_CreateObject();
     char *raw = xml_text(taf, "raw_text");
     if (raw)
