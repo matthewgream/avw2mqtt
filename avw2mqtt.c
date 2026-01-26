@@ -24,6 +24,8 @@
 #define MAX_TOPIC 256
 #define MAX_NAME 128
 
+#define TEXT_DESCRIPTION_NO_HEADER
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -325,7 +327,7 @@ static void format_time(char *out, size_t sz, const char *iso) {
     struct tm tm = {0};
     if (sscanf(iso, "%d-%d-%dT%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min) == 5) {
         static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-        snprintf(out, sz, "%d %s %02d%02dZ", tm.tm_mday, months[tm.tm_mon - 1], tm.tm_hour, tm.tm_min);
+        snprintf(out, sz, "%s-%d-%02d%02dZ", months[tm.tm_mon - 1], tm.tm_mday, tm.tm_hour, tm.tm_min);
     }
 }
 static void format_wind(char *out, size_t sz, xmlNode *node) {
@@ -456,7 +458,7 @@ static void format_sky(char *out, size_t sz, xmlNode *node) {
             cover_txt = "no significant cloud";
             has_base = 0;
         } else if (!strcmp(cover, "CAVOK")) {
-            cover_txt = "CAVOK";
+            cover_txt = "cavok";
             has_base = 0;
         } else if (!strcmp(cover, "VV"))
             cover_txt = "vertical visibility";
@@ -518,7 +520,7 @@ static void format_forecast_time(char *out, size_t sz, xmlNode *node) {
 static void format_category(char *out, size_t sz, xmlNode *node) {
     char *cat = xml_text(node, "flight_category");
     if (cat)
-        append(out, sz, "Category %s; ", cat);
+        append(out, sz, "%s; ", cat);
 }
 static void format_change(char *out, size_t sz, xmlNode *node) {
     char *change = xml_text(node, "change_indicator");
@@ -558,6 +560,9 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
     char *obs_time = xml_text(metar, "observation_time");
     if (obs_time)
         format_time(timestr, sizeof(timestr), obs_time);
+#ifdef TEXT_DESCRIPTION_NO_HEADER
+    snprintf(text, sizeof(text), "issued %s\n", timestr);
+#else
     station_t *st = station_lookup(icao);
     if (st && st->name[0]) {
         char name[MAX_NAME];
@@ -567,6 +572,7 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
     } else {
         snprintf(text, sizeof(text), "METAR for %s issued %s\n", icao, timestr);
     }
+#endif
 
     format_wind(text, sizeof(text), metar);
     format_vis(text, sizeof(text), metar);
@@ -611,6 +617,9 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
     char *valid_to = xml_text(taf, "valid_time_to");
     if (valid_to)
         format_time(t3, sizeof(t3), valid_to);
+#ifdef TEXT_DESCRIPTION_NO_HEADER
+    snprintf(text, sizeof(text), "issued %s valid %s to %s\n", t1, t2, t3);
+#else
     station_t *st = station_lookup(icao);
     if (st && st->name[0]) {
         char name[MAX_NAME];
@@ -620,6 +629,7 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
     } else {
         snprintf(text, sizeof(text), "TAF for %s issued %s valid %s to %s\n", icao, t1, t2, t3);
     }
+#endif
 
     for (xmlNode *fc = taf->children; fc; fc = fc->next)
         if (fc->type == XML_ELEMENT_NODE && !strcmp((char *)fc->name, "forecast")) {
