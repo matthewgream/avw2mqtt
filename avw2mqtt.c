@@ -433,7 +433,12 @@ static void format_temp(char *out, size_t sz, xmlNode *node) {
 static void format_press(char *out, size_t sz, xmlNode *node) {
     char *altim = xml_text(node, "altim_in_hg");
     if (altim)
-        append(out, sz, "QNH %d hPa", (int)(0.5 + 33.8639 * atof(altim)));
+        append(out, sz, "QNH %d hPa; ", (int)(0.5 + 33.8639 * atof(altim)));
+}
+static void format_category(char *out, size_t sz, xmlNode *node) {
+    char *cat = xml_text(node, "flight_category");
+    if (cat)
+        append(out, sz, "Category %s; ", cat);
 }
 static void format_time(char *out, size_t sz, const char *iso) {
     struct tm tm = {0};
@@ -441,6 +446,12 @@ static void format_time(char *out, size_t sz, const char *iso) {
         static const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
         snprintf(out, sz, "%d %s %02d%02dZ", tm.tm_mday, months[tm.tm_mon - 1], tm.tm_hour, tm.tm_min);
     }
+}
+static void format_end(char *out, size_t sz) {
+    if (strlen(out) > 2)
+        if (out[strlen(out) - 1] == ' ' && out[strlen(out) - 2] == ';')
+            out[strlen(out) - 2] = '\0';
+    append(out, sz, "\n");
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -479,9 +490,8 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
     format_sky(text, sizeof(text), metar);
     format_temp(text, sizeof(text), metar);
     format_press(text, sizeof(text), metar);
-    char *flight_cat = xml_text(metar, "flight_category");
-    if (flight_cat)
-        append(text, sizeof(text), "; Category %s", flight_cat);
+    format_category(text, sizeof(text), metar);
+    format_end(text, sizeof(text));
 
     // printf("METAR: %s\n", text);
     cJSON *json = cJSON_CreateObject();
@@ -544,7 +554,7 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
             format_vis(text, sizeof(text), fc);
             format_wx(text, sizeof(text), fc);
             format_sky(text, sizeof(text), fc);
-            append(text, sizeof(text), "\n");
+            format_end(text, sizeof(text));
         }
     }
 
