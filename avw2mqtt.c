@@ -557,9 +557,9 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
     char text[2048] = "";
 
     char timestr[64] = "";
-    char *obs_time = xml_text(metar, "observation_time");
-    if (obs_time)
-        format_time(timestr, sizeof(timestr), obs_time);
+    char *observed = xml_text(metar, "observation_time");
+    if (observed)
+        format_time(timestr, sizeof(timestr), observed);
 #ifdef TEXT_DESCRIPTION_NO_HEADER
     snprintf(text, sizeof(text), "issued %s\n", timestr);
 #else
@@ -585,6 +585,8 @@ static cJSON *process_metar(const char *xml_data, const char *icao) {
 
     // printf("METAR: %s\n", text);
     cJSON *json = cJSON_CreateObject();
+    if (observed)
+        cJSON_AddStringToObject(json, "observed", observed);
     char *raw = xml_text(metar, "raw_text");
     if (raw)
         cJSON_AddStringToObject(json, "raw", raw);
@@ -608,9 +610,9 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
     char text[4096] = "";
 
     char t1[64] = "", t2[64] = "", t3[64] = "";
-    char *issue = xml_text(taf, "issue_time");
-    if (issue)
-        format_time(t1, sizeof(t1), issue);
+    char *issued = xml_text(taf, "issue_time");
+    if (issued)
+        format_time(t1, sizeof(t1), issued);
     char *valid_from = xml_text(taf, "valid_time_from");
     if (valid_from)
         format_time(t2, sizeof(t2), valid_from);
@@ -644,6 +646,8 @@ static cJSON *process_taf(const char *xml_data, const char *icao) {
 
     // printf("TAF: %s\n", text);
     cJSON *json = cJSON_CreateObject();
+    if (issued)
+        cJSON_AddStringToObject(json, "issued", issued);
     char *raw = xml_text(taf, "raw_text");
     if (raw)
         cJSON_AddStringToObject(json, "raw", raw);
