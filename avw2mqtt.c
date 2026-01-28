@@ -26,8 +26,8 @@
 #define MAX_NAME 128
 
 #define LEARN_SAMPLES 5
-#define METAR_CAP_MINUTES 30
-#define TAF_CAP_MINUTES 60
+#define METAR_CAP_MINUTES 35
+#define TAF_CAP_MINUTES 65
 #define SLACK_SECONDS 60
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -39,7 +39,6 @@ typedef struct station {
     char country[MAX_COUNTRY];
     char iata[MAX_IATA];
     double lat, lon, elev;
-    struct station *next;
 } station_t;
 
 typedef struct {
@@ -54,8 +53,13 @@ typedef struct {
     char icao[MAX_ICAO];
     int fetch_metar, fetch_taf, interval;
     time_t last_fetch;
-    schedule_t metar_sched;
-    schedule_t taf_sched;
+    schedule_t sched_metar, sched_taf;
+    cJSON *json;
+    // station data (cached)
+    char name[MAX_NAME];
+    char country[MAX_COUNTRY];
+    char iata[MAX_IATA];
+    double lat, lon, elev;
 } airport_t;
 
 typedef struct {
@@ -80,16 +84,15 @@ typedef struct {
     int header;
     int all;
     int learn;
+    int split;
     const char *config_path;
 } options_t;
 
-#define HASH_SIZE 1024
-static station_t *station_hash[HASH_SIZE];
 static volatile int running = 1;
 static struct mosquitto *mosq = NULL;
 
 static config_t cfg;
-static options_t opts = {0, 0, 0, 1, "avw2mqtt.conf"};
+static options_t opts = {0, 0, 0, 1, 0, "avw2mqtt.conf"};
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -164,20 +167,9 @@ static const char *parse_value_num(const char *p, double *out) {
     return end;
 }
 
-static unsigned hash_icao(const char *icao) {
-    unsigned h = 0;
-    while (*icao)
-        h = h * 31 + (unsigned char)toupper(*icao++);
-    return h % HASH_SIZE;
-}
+typedef void (*station_cb)(const station_t *st, void *userdata);
 
-static void station_add(station_t *st) {
-    unsigned h = hash_icao(st->icao);
-    st->next = station_hash[h];
-    station_hash[h] = st;
-}
-
-static int stations_load(const char *path) {
+static int stations_load(const char *path, station_cb cb, void *userdata) {
     char *data = read_file(path, "stations");
     if (!data)
         return -1;
@@ -222,10 +214,10 @@ static int stations_load(const char *path) {
             continue;
         p++;
 
-        station_t *st = calloc(1, sizeof(station_t));
+        station_t st = {0};
         for (char *c = icao; *c; c++)
             *c = (char)toupper(*c);
-        memcpy(st->icao, icao, sizeof(st->icao));
+        memcpy(st.icao, icao, sizeof(st.icao));
 
         while (*p && *p != '}') {
             p = parse_skip_ws(p);
@@ -248,20 +240,20 @@ static int stations_load(const char *path) {
             p = parse_skip_ws(p);
 
             if (strcmp(key, "name") == 0) {
-                p = parse_value_str(p, st->name, sizeof(st->name));
+                p = parse_value_str(p, st.name, sizeof(st.name));
             } else if (strcmp(key, "country") == 0) {
-                p = parse_value_str(p, st->country, sizeof(st->country));
+                p = parse_value_str(p, st.country, sizeof(st.country));
             } else if (strcmp(key, "iata") == 0) {
-                p = parse_value_str(p, st->iata, sizeof(st->iata));
-                char *e = st->iata + strlen(st->iata) - 1;
-                while (e >= st->iata && isspace(*e))
+                p = parse_value_str(p, st.iata, sizeof(st.iata));
+                char *e = st.iata + strlen(st.iata) - 1;
+                while (e >= st.iata && isspace(*e))
                     *e-- = 0;
             } else if (strcmp(key, "lat") == 0) {
-                p = parse_value_num(p, &st->lat);
+                p = parse_value_num(p, &st.lat);
             } else if (strcmp(key, "lon") == 0) {
-                p = parse_value_num(p, &st->lon);
+                p = parse_value_num(p, &st.lon);
             } else if (strcmp(key, "elev") == 0) {
-                p = parse_value_num(p, &st->elev);
+                p = parse_value_num(p, &st.elev);
             } else {
                 if (*p == '\'' || *p == '"') {
                     char dummy[256];
@@ -283,33 +275,13 @@ static int stations_load(const char *path) {
         if (*p == ',')
             p++;
 
-        station_add(st);
+        cb(&st, userdata);
         count++;
     }
 
     free(data);
-    printf("stations: loaded %d item(s)\n", count);
+    debug("stations: parsed %d item(s)", count);
     return 0;
-}
-
-static void stations_free(void) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        station_t *s = station_hash[i];
-        while (s) {
-            station_t *next = s->next;
-            free(s);
-            s = next;
-        }
-        station_hash[i] = NULL;
-    }
-}
-
-static station_t *station_lookup(const char *icao) {
-    unsigned h = hash_icao(icao);
-    for (station_t *s = station_hash[h]; s; s = s->next)
-        if (strcasecmp(s->icao, icao) == 0)
-            return s;
-    return NULL;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -637,19 +609,23 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
     if (delta_count == 0)
         return;
 
-    int sum = 0;
-    for (int i = 0; i < delta_count; i++)
-        sum += deltas[i];
-    const int avg = sum / delta_count;
+    int min_delta = deltas[0];
+    for (int i = 1; i < delta_count; i++)
+        if (deltas[i] < min_delta)
+            min_delta = deltas[i];
+
     int consistent = 1;
-    for (int i = 0; i < delta_count; i++)
-        if (abs(deltas[i] - avg) > 120) {
+    for (int i = 0; i < delta_count; i++) {
+        int remainder = deltas[i] % min_delta;
+        if (remainder > 120 && remainder < min_delta - 120) {
             consistent = 0;
             break;
         }
+    }
+
     if (consistent && sched->sample_count >= LEARN_SAMPLES) {
-        sched->learned_period = avg;
-        debug("[%s] %s learned period: %d seconds (%d minutes)", icao, type, avg, avg / 60);
+        sched->learned_period = min_delta;
+        debug("[%s] %s learned period: %d seconds (%d minutes)", icao, type, min_delta, min_delta / 60);
     }
 
     const int cap_seconds = cap_minutes * 60;
@@ -662,28 +638,34 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
 static void schedule_update_next(schedule_t *sched, const char *icao, const char *type, int default_interval, int cap_minutes) {
     const time_t now = time(NULL);
     if (sched->learned_period > 0 && sched->last_issued > 0) {
-        sched->next_fetch = sched->last_issued + sched->learned_period + SLACK_SECONDS;
-        if (sched->next_fetch < now)
-            sched->next_fetch = now;
+        time_t next = sched->last_issued + sched->learned_period;
+        while (next <= now)
+            next += sched->learned_period;
+        sched->next_fetch = next + SLACK_SECONDS;
         debug("[%s] %s next fetch at %ld (in %ld seconds)", icao, type, sched->next_fetch, sched->next_fetch - now);
     } else {
-        const int interval = default_interval * 60, cap = cap_minutes * 60;
-        sched->next_fetch = now + (interval > cap ? cap : interval);
-        debug("[%s] %s next fetch in %d seconds (default)", icao, type, (interval > cap ? cap : interval));
+        const int cap = cap_minutes * 60;
+        int interval = default_interval * 60;
+        if (interval > cap)
+            interval = cap;
+        sched->next_fetch = now + interval;
+        debug("[%s] %s next fetch in %d seconds (default)", icao, type, interval);
     }
 }
 
 static void schedule_missed(schedule_t *sched, const char *icao, const char *type) {
-    if (sched->learned_period > 0) {
-        debug("[%s] %s missed update, halving period from %d to %d", icao, type, sched->learned_period, sched->learned_period / 2);
-        sched->learned_period /= 2;
-        sched->sample_count = 0; // Reset samples to relearn
+    if (sched->sample_count > 2) {
+        debug("[%s] %s unexpected timing, reducing samples %d -> 2", icao, type, sched->sample_count);
+        sched->samples[0] = sched->samples[sched->sample_count - 2];
+        sched->samples[1] = sched->samples[sched->sample_count - 1];
+        sched->sample_count = 2;
     }
+    sched->learned_period = 0;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static cJSON *process_metar(const char *xml_data, const char *icao, time_t *out_observed) {
+static cJSON *process_metar(const char *xml_data, const airport_t *ap, time_t *out_observed) {
     xmlDoc *doc = xmlReadMemory(xml_data, (int)strlen(xml_data), NULL, NULL, 0);
     if (!doc)
         return NULL;
@@ -705,14 +687,13 @@ static cJSON *process_metar(const char *xml_data, const char *icao, time_t *out_
         *out_observed = parse_iso_time(observed);
 
     if (opts.header) {
-        const station_t *st = station_lookup(icao);
-        if (st && st->name[0]) {
+        if (ap->name[0]) {
             char name[MAX_NAME];
-            strncpy(name, st->name, sizeof(name));
+            strncpy(name, ap->name, sizeof(name));
             name[0] = (char)toupper(name[0]);
-            append(text, sizeof(text), "METAR for %s (%s) issued %s\n", name, icao, timestr);
+            append(text, sizeof(text), "METAR for %s (%s) issued %s\n", name, ap->icao, timestr);
         } else {
-            append(text, sizeof(text), "METAR for %s issued %s\n", icao, timestr);
+            append(text, sizeof(text), "METAR for %s issued %s\n", ap->icao, timestr);
         }
     } else {
         append(text, sizeof(text), "issued %s\n", timestr);
@@ -728,8 +709,8 @@ static cJSON *process_metar(const char *xml_data, const char *icao, time_t *out_
     format_end(text, sizeof(text));
 
     const char *raw = xml_text(metar, "raw_text");
-    debug("[%s] METAR raw: %s", icao, raw ? raw : "(none)");
-    debug("[%s] METAR text: %s", icao, text);
+    debug("[%s] METAR raw: %s", ap->icao, raw ? raw : "(none)");
+    debug("[%s] METAR text: %s", ap->icao, text);
 
     cJSON *json = cJSON_CreateObject();
     if (observed)
@@ -741,7 +722,7 @@ static cJSON *process_metar(const char *xml_data, const char *icao, time_t *out_
     return json;
 }
 
-static cJSON *process_taf(const char *xml_data, const char *icao, time_t *out_issued) {
+static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out_issued) {
     xmlDoc *doc = xmlReadMemory(xml_data, (int)strlen(xml_data), NULL, NULL, 0);
     if (!doc)
         return NULL;
@@ -769,14 +750,13 @@ static cJSON *process_taf(const char *xml_data, const char *icao, time_t *out_is
         format_time(t3, sizeof(t3), valid_to);
 
     if (opts.header) {
-        const station_t *st = station_lookup(icao);
-        if (st && st->name[0]) {
+        if (ap->name[0]) {
             char name[MAX_NAME];
-            strncpy(name, st->name, sizeof(name));
+            strncpy(name, ap->name, sizeof(name));
             name[0] = (char)toupper(name[0]);
-            append(text, sizeof(text), "TAF for %s (%s) issued %s valid %s to %s\n", name, icao, t1, t2, t3);
+            append(text, sizeof(text), "TAF for %s (%s) issued %s valid %s to %s\n", name, ap->icao, t1, t2, t3);
         } else {
-            append(text, sizeof(text), "TAF for %s issued %s valid %s to %s\n", icao, t1, t2, t3);
+            append(text, sizeof(text), "TAF for %s issued %s valid %s to %s\n", ap->icao, t1, t2, t3);
         }
     } else {
         append(text, sizeof(text), "issued %s valid %s to %s\n", t1, t2, t3);
@@ -794,8 +774,8 @@ static cJSON *process_taf(const char *xml_data, const char *icao, time_t *out_is
         }
 
     const char *raw = xml_text(taf, "raw_text");
-    debug("[%s] TAF raw: %s", icao, raw ? raw : "(none)");
-    debug("[%s] TAF text: %s", icao, text);
+    debug("[%s] TAF raw: %s", ap->icao, raw ? raw : "(none)");
+    debug("[%s] TAF text: %s", ap->icao, text);
 
     cJSON *json = cJSON_CreateObject();
     if (issued)
@@ -810,64 +790,76 @@ static cJSON *process_taf(const char *xml_data, const char *icao, time_t *out_is
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static void publish_payload(const airport_t *ap, const cJSON *root, const char *suffix) {
+    char *payload = cJSON_PrintUnformatted(root);
+    char topic[MAX_TOPIC];
+    snprintf(topic, sizeof(topic), "%s/%s%s%s", cfg.topic_prefix, ap->icao, suffix ? "/" : "", suffix ? suffix : "");
+    printf("publish: %s to %s\n", ap->icao, topic);
+    mosquitto_publish(mosq, NULL, topic, (int)strlen(payload), payload, 0, true);
+    free(payload);
+}
+static void publish_type(airport_t *ap, const char *timestamp, const cJSON *object, const char *name) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "timestamp", timestamp);
+    cJSON_AddItemToObject(root, "airport", cJSON_Duplicate(ap->json, 1));
+    cJSON_AddItemToObject(root, name, cJSON_Duplicate(object, 1));
+    publish_payload(ap, root, name);
+    cJSON_Delete(root);
+}
+static void publish_split(airport_t *ap, const char *timestamp, const cJSON *metar, int metar_changed, const cJSON *taf, int taf_changed) {
+    if (metar && metar_changed)
+        publish_type(ap, timestamp, metar, "metar");
+    if (taf && taf_changed)
+        publish_type(ap, timestamp, taf, "taf");
+}
+
+static void publish_combined(airport_t *ap, const char *timestamp, const cJSON *metar, const cJSON *taf) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "timestamp", timestamp);
+    cJSON_AddItemToObject(root, "airport", cJSON_Duplicate(ap->json, 1));
+    if (metar)
+        cJSON_AddItemToObject(root, "metar", cJSON_Duplicate(metar, 1));
+    if (taf)
+        cJSON_AddItemToObject(root, "taf", cJSON_Duplicate(taf, 1));
+    publish_payload(ap, root, NULL);
+    cJSON_Delete(root);
+}
+
 static void fetch_and_publish(airport_t *ap) {
     char timestamp[32];
     const time_t now = time(NULL);
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "timestamp", timestamp);
-
-    cJSON *airport = cJSON_AddObjectToObject(root, "airport");
-    cJSON_AddStringToObject(airport, "icao", ap->icao);
-
-    const station_t *st = station_lookup(ap->icao);
-    if (st) {
-        if (st->name[0])
-            cJSON_AddStringToObject(airport, "name", st->name);
-        if (st->country[0])
-            cJSON_AddStringToObject(airport, "country", st->country);
-        if (st->iata[0])
-            cJSON_AddStringToObject(airport, "iata", st->iata);
-        cJSON_AddNumberToObject(airport, "lat", st->lat);
-        cJSON_AddNumberToObject(airport, "lon", st->lon);
-        cJSON_AddNumberToObject(airport, "elev_km", st->elev);
-    }
-
-    int publish_metar = 0, publish_taf = 0;
+    cJSON *metar = NULL, *taf = NULL;
+    int metar_changed = 0, taf_changed = 0;
+    time_t observed = 0, issued = 0;
 
     if (ap->fetch_metar) {
         char url[MAX_URL];
         snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/metar?format=xml&taf=false&ids=%s", ap->icao);
         char *xml = fetch_url(url);
         if (xml) {
-            time_t observed = 0;
-            cJSON *metar = process_metar(xml, ap->icao, &observed);
-            if (metar) {
-                if (opts.all) {
-                    cJSON_AddItemToObject(root, "metar", metar);
-                    publish_metar = 1;
-                } else {
-                    if (observed != ap->metar_sched.last_issued) {
-                        if (ap->metar_sched.last_issued != 0 && observed < ap->metar_sched.next_fetch - SLACK_SECONDS)
-                            schedule_missed(&ap->metar_sched, ap->icao, "METAR");
-                        cJSON_AddItemToObject(root, "metar", metar);
-                        publish_metar = 1;
-                        debug("[%s] METAR changed: %ld -> %ld", ap->icao, ap->metar_sched.last_issued, observed);
-                        if (opts.learn) {
-                            schedule_add_sample(&ap->metar_sched, observed);
-                            schedule_learn(&ap->metar_sched, ap->icao, "METAR", METAR_CAP_MINUTES);
-                        }
-                        ap->metar_sched.last_issued = observed;
-                    } else {
-                        debug("[%s] METAR unchanged, skipping publish", ap->icao);
-                        cJSON_Delete(metar);
-                    }
-                }
-                if (opts.learn)
-                    schedule_update_next(&ap->metar_sched, ap->icao, "METAR", ap->interval, METAR_CAP_MINUTES);
-            }
+            metar = process_metar(xml, ap, &observed);
             free(xml);
+        }
+        if (metar) {
+            if (opts.all) {
+                metar_changed = 1;
+            } else if (observed != ap->sched_metar.last_issued) {
+                if (ap->sched_metar.last_issued != 0 && observed < ap->sched_metar.next_fetch - SLACK_SECONDS)
+                    schedule_missed(&ap->sched_metar, ap->icao, "METAR");
+                metar_changed = 1;
+                debug("[%s] METAR changed: %ld -> %ld", ap->icao, ap->sched_metar.last_issued, observed);
+                if (opts.learn) {
+                    schedule_add_sample(&ap->sched_metar, observed);
+                    schedule_learn(&ap->sched_metar, ap->icao, "METAR", METAR_CAP_MINUTES);
+                }
+                ap->sched_metar.last_issued = observed;
+            } else {
+                debug("[%s] METAR unchanged", ap->icao);
+            }
+            if (opts.learn)
+                schedule_update_next(&ap->sched_metar, ap->icao, "METAR", ap->interval, METAR_CAP_MINUTES);
         }
     }
 
@@ -876,48 +868,43 @@ static void fetch_and_publish(airport_t *ap) {
         snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/taf?format=xml&ids=%s", ap->icao);
         char *xml = fetch_url(url);
         if (xml) {
-            time_t issued = 0;
-            cJSON *taf = process_taf(xml, ap->icao, &issued);
-            if (taf) {
-                if (opts.all) {
-                    cJSON_AddItemToObject(root, "taf", taf);
-                    publish_taf = 1;
-                } else {
-                    if (issued != ap->taf_sched.last_issued) {
-                        if (ap->taf_sched.last_issued != 0 && issued < ap->taf_sched.next_fetch - SLACK_SECONDS)
-                            schedule_missed(&ap->taf_sched, ap->icao, "TAF");
-                        cJSON_AddItemToObject(root, "taf", taf);
-                        publish_taf = 1;
-                        debug("[%s] TAF changed: %ld -> %ld", ap->icao, ap->taf_sched.last_issued, issued);
-                        if (opts.learn) {
-                            schedule_add_sample(&ap->taf_sched, issued);
-                            schedule_learn(&ap->taf_sched, ap->icao, "TAF", TAF_CAP_MINUTES);
-                        }
-                        ap->taf_sched.last_issued = issued;
-                    } else {
-                        debug("[%s] TAF unchanged, skipping publish", ap->icao);
-                        cJSON_Delete(taf);
-                    }
-                }
-                if (opts.learn)
-                    schedule_update_next(&ap->taf_sched, ap->icao, "TAF", ap->interval, TAF_CAP_MINUTES);
-            }
+            taf = process_taf(xml, ap, &issued);
             free(xml);
+        }
+        if (taf) {
+            if (opts.all) {
+                taf_changed = 1;
+            } else if (issued != ap->sched_taf.last_issued) {
+                if (ap->sched_taf.last_issued != 0 && issued < ap->sched_taf.next_fetch - SLACK_SECONDS)
+                    schedule_missed(&ap->sched_taf, ap->icao, "TAF");
+                taf_changed = 1;
+                debug("[%s] TAF changed: %ld -> %ld", ap->icao, ap->sched_taf.last_issued, issued);
+                if (opts.learn) {
+                    schedule_add_sample(&ap->sched_taf, issued);
+                    schedule_learn(&ap->sched_taf, ap->icao, "TAF", TAF_CAP_MINUTES);
+                }
+                ap->sched_taf.last_issued = issued;
+            } else {
+                debug("[%s] TAF unchanged", ap->icao);
+            }
+            if (opts.learn)
+                schedule_update_next(&ap->sched_taf, ap->icao, "TAF", ap->interval, TAF_CAP_MINUTES);
         }
     }
 
-    if (publish_metar || publish_taf) {
-        char topic[MAX_TOPIC];
-        snprintf(topic, sizeof(topic), "%s/%s", cfg.topic_prefix, ap->icao);
-        char *payload = cJSON_PrintUnformatted(root);
-        printf("publish: %s to %s\n", ap->icao, topic);
-        mosquitto_publish(mosq, NULL, topic, (int)strlen(payload), payload, 0, true);
-        free(payload);
+    if (opts.split) {
+        publish_split(ap, timestamp, metar, metar_changed, taf, taf_changed);
     } else {
-        debug("[%s] nothing to publish", ap->icao);
+        if (metar_changed || taf_changed)
+            publish_combined(ap, timestamp, metar, taf);
+        else
+            debug("[%s] nothing to publish", ap->icao);
     }
 
-    cJSON_Delete(root);
+    if (metar)
+        cJSON_Delete(metar);
+    if (taf)
+        cJSON_Delete(taf);
     ap->last_fetch = now;
 }
 
@@ -927,10 +914,10 @@ static int should_fetch(const airport_t *ap) {
         return (now - ap->last_fetch >= ap->interval * 60);
     int fetch = 0;
     if (ap->fetch_metar)
-        if (ap->metar_sched.next_fetch == 0 || now >= ap->metar_sched.next_fetch)
+        if (ap->sched_metar.next_fetch == 0 || now >= ap->sched_metar.next_fetch)
             fetch = 1;
     if (ap->fetch_taf)
-        if (ap->taf_sched.next_fetch == 0 || now >= ap->taf_sched.next_fetch)
+        if (ap->sched_taf.next_fetch == 0 || now >= ap->sched_taf.next_fetch)
             fetch = 1;
     return fetch;
 }
@@ -942,7 +929,6 @@ static int config_load(const char *path) {
     char *data = read_file(path, "config");
     if (!data)
         return -1;
-
     cJSON *json = cJSON_Parse(data);
     free(data);
     if (!json) {
@@ -1005,6 +991,41 @@ static int config_load(const char *path) {
     return 0;
 }
 
+static void airports_build_json(void) {
+    for (int i = 0; i < cfg.airport_count; i++) {
+        airport_t *ap = &cfg.airports[i];
+        ap->json = cJSON_CreateObject();
+        cJSON_AddStringToObject(ap->json, "icao", ap->icao);
+        if (ap->name[0]) {
+            cJSON_AddStringToObject(ap->json, "name", ap->name);
+            cJSON_AddNumberToObject(ap->json, "lat", ap->lat);
+            cJSON_AddNumberToObject(ap->json, "lon", ap->lon);
+            cJSON_AddNumberToObject(ap->json, "elev_km", ap->elev);
+        }
+        if (ap->country[0])
+            cJSON_AddStringToObject(ap->json, "country", ap->country);
+        if (ap->iata[0])
+            cJSON_AddStringToObject(ap->json, "iata", ap->iata);
+    }
+}
+
+static void station_match_cb(const station_t *st, void *userdata) {
+    (void)userdata;
+    for (int i = 0; i < cfg.airport_count; i++) {
+        airport_t *ap = &cfg.airports[i];
+        if (strcmp(ap->icao, st->icao) == 0) {
+            debug("[%s] loaded from stations file: '%s'", st->icao, st->name);
+            memcpy(ap->name, st->name, sizeof(ap->name));
+            memcpy(ap->country, st->country, sizeof(ap->country));
+            memcpy(ap->iata, st->iata, sizeof(ap->iata));
+            ap->lat = st->lat;
+            ap->lon = st->lon;
+            ap->elev = st->elev;
+            return;
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1021,15 +1042,17 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -H, --header        Include header in text output\n");
     fprintf(stderr, "  -a, --all           Publish all fetches (don't skip unchanged)\n");
     fprintf(stderr, "  -l, --learn         Learn fetch schedule (default when not -a)\n");
+    fprintf(stderr, "  -s, --split         Split METAR/TAF into separate topics\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
 
 int main(int argc, char **argv) {
     static struct option long_options[] = {
-        {"config", required_argument, 0, 'c'}, {"debug", no_argument, 0, 'd'}, {"header", no_argument, 0, 'H'}, {"all", no_argument, 0, 'a'}, {"learn", no_argument, 0, 'l'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0},
+        {"config", required_argument, 0, 'c'}, {"debug", no_argument, 0, 'd'}, {"header", no_argument, 0, 'H'}, {"all", no_argument, 0, 'a'},
+        {"learn", no_argument, 0, 'l'},        {"split", no_argument, 0, 's'}, {"help", no_argument, 0, 'h'},   {0, 0, 0, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "c:dHalh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:dHalsh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'c':
             opts.config_path = optarg;
@@ -1046,6 +1069,9 @@ int main(int argc, char **argv) {
             break;
         case 'l':
             opts.learn = 1;
+            break;
+        case 's':
+            opts.split = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -1072,11 +1098,12 @@ int main(int argc, char **argv) {
     printf("airports: loaded %d item(s)\n", cfg.airport_count);
 
     if (cfg.stations_file[0])
-        if (stations_load(cfg.stations_file) < 0)
-            fprintf(stderr, "stations: none loaded\n");
+        stations_load(cfg.stations_file, station_match_cb, NULL);
+    airports_build_json();
 
     debug("mode: %s", opts.all ? "all (publish every fetch)" : "smart (skip unchanged)");
     debug("learning: %s", opts.learn ? "enabled" : "disabled");
+    debug("topics: %s", opts.split ? "split (metar/taf separate)" : "combined");
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1125,7 +1152,9 @@ int main(int argc, char **argv) {
     mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
     curl_global_cleanup();
-    stations_free();
+    for (int i = 0; i < cfg.airport_count; i++)
+        if (cfg.airports[i].json)
+            cJSON_Delete(cfg.airports[i].json);
     return EXIT_SUCCESS;
 }
 
