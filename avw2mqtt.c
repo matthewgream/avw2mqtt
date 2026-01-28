@@ -412,7 +412,7 @@ static void format_wx(char *out, size_t sz, xmlNode *node) {
     if (wx[0] == '+')
         append(out, sz, " heavy");
     if (strstr(wx, "NSW"))
-        append(out, sz, " insignificant");
+        append(out, sz, " no significant");
     if (strstr(wx, "RA"))
         append(out, sz, " rain");
     if (strstr(wx, "SN"))
@@ -598,7 +598,6 @@ static void schedule_add_sample(schedule_t *sched, time_t issued) {
 static void schedule_learn(schedule_t *sched, const char *icao, const char *type, int cap_minutes) {
     if (sched->sample_count < 2)
         return;
-
     int deltas[LEARN_SAMPLES - 1];
     int delta_count = 0;
     for (int i = 1; i < sched->sample_count; i++) {
@@ -608,12 +607,10 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
     }
     if (delta_count == 0)
         return;
-
     int min_delta = deltas[0];
     for (int i = 1; i < delta_count; i++)
         if (deltas[i] < min_delta)
             min_delta = deltas[i];
-
     int consistent = 1;
     for (int i = 0; i < delta_count; i++) {
         int remainder = deltas[i] % min_delta;
@@ -622,12 +619,10 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
             break;
         }
     }
-
     if (consistent && sched->sample_count >= LEARN_SAMPLES) {
         sched->learned_period = min_delta;
         debug("[%s] %s learned period: %d seconds (%d minutes)", icao, type, min_delta, min_delta / 60);
     }
-
     const int cap_seconds = cap_minutes * 60;
     if (sched->learned_period > cap_seconds) {
         debug("[%s] %s period capped from %d to %d seconds", icao, type, sched->learned_period, cap_seconds);
@@ -1008,6 +1003,11 @@ static void airports_build_json(void) {
             cJSON_AddStringToObject(ap->json, "iata", ap->iata);
     }
 }
+static void airports_free(void) {
+    for (int i = 0; i < cfg.airport_count; i++)
+        if (cfg.airports[i].json)
+            cJSON_Delete(cfg.airports[i].json);
+}
 
 static void station_match_cb(const station_t *st, void *userdata) {
     (void)userdata;
@@ -1152,9 +1152,7 @@ int main(int argc, char **argv) {
     mosquitto_destroy(mosq);
     mosquitto_lib_cleanup();
     curl_global_cleanup();
-    for (int i = 0; i < cfg.airport_count; i++)
-        if (cfg.airports[i].json)
-            cJSON_Delete(cfg.airports[i].json);
+    airports_free();
     return EXIT_SUCCESS;
 }
 
