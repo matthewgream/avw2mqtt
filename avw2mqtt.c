@@ -720,19 +720,20 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
 
     char text[4096] = "";
 
-    char t1[64] = "", t2[64] = "", t3[64] = "";
+    char t1[64] = "";
     const char *issued = xml_text(taf, "issue_time");
     if (issued)
         format_time(t1, sizeof(t1), issued);
     if (out_issued)
         *out_issued = parse_iso_time(issued);
+#if 0
+    char t2[64] = "", t3[64] = "";
     const char *valid_from = xml_text(taf, "valid_time_from");
     if (valid_from)
         format_time(t2, sizeof(t2), valid_from);
     const char *valid_to = xml_text(taf, "valid_time_to");
     if (valid_to)
         format_time(t3, sizeof(t3), valid_to);
-
     if (opts.header) {
         if (ap->name[0])
             append(text, sizeof(text), "TAF for %s (%s) issued %s valid %s/%s", ap->name, ap->icao, t1, t2, t3);
@@ -740,6 +741,15 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
             append(text, sizeof(text), "TAF for %s issued %s valid %s/%s", ap->icao, t1, t2, t3);
     } else {
         append(text, sizeof(text), "issued %s valid %s/%s", t1, t2, t3);
+    }
+#endif
+    if (opts.header) {
+        if (ap->name[0])
+            append(text, sizeof(text), "TAF for %s (%s) issued %s", ap->name, ap->icao, t1);
+        else
+            append(text, sizeof(text), "TAF for %s issued %s", ap->icao, t1);
+    } else {
+        append(text, sizeof(text), "issued %s", t1);
     }
     append(text, sizeof(text), "; ");
 
