@@ -1,7 +1,6 @@
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-#define _GNU_SOURCE
 #include <ctype.h>
 #include <getopt.h>
 #include <signal.h>
@@ -37,8 +36,7 @@ typedef struct station {
     char icao[MAX_ICAO];
     char name[MAX_NAME];
     char country[MAX_COUNTRY];
-    char iata[MAX_IATA];
-    double lat, lon, elev;
+    double lat, lon, elev_km;
 } station_t;
 
 typedef struct {
@@ -51,15 +49,14 @@ typedef struct {
 
 typedef struct {
     char icao[MAX_ICAO];
+    char name[MAX_NAME];
+    char country[MAX_COUNTRY];
+    double lat, lon, elev;
+    cJSON *json;
+    //
     int fetch_metar, fetch_taf, interval;
     time_t last_fetch;
     schedule_t sched_metar, sched_taf;
-    cJSON *json;
-    // station data (cached)
-    char name[MAX_NAME];
-    char country[MAX_COUNTRY];
-    char iata[MAX_IATA];
-    double lat, lon, elev;
 } airport_t;
 
 typedef struct {
@@ -167,9 +164,9 @@ static const char *parse_value_num(const char *p, double *out) {
     return end;
 }
 
-typedef void (*station_cb)(const station_t *st, void *userdata);
+typedef void (*station_load_cb)(const station_t *st, void *userdata);
 
-static int stations_load(const char *path, station_cb cb, void *userdata) {
+static int stations_load(const char *path, station_load_cb cb, void *userdata) {
     char *data = read_file(path, "stations");
     if (!data)
         return -1;
@@ -243,17 +240,12 @@ static int stations_load(const char *path, station_cb cb, void *userdata) {
                 p = parse_value_str(p, st.name, sizeof(st.name));
             } else if (strcmp(key, "country") == 0) {
                 p = parse_value_str(p, st.country, sizeof(st.country));
-            } else if (strcmp(key, "iata") == 0) {
-                p = parse_value_str(p, st.iata, sizeof(st.iata));
-                char *e = st.iata + strlen(st.iata) - 1;
-                while (e >= st.iata && isspace(*e))
-                    *e-- = 0;
             } else if (strcmp(key, "lat") == 0) {
                 p = parse_value_num(p, &st.lat);
             } else if (strcmp(key, "lon") == 0) {
                 p = parse_value_num(p, &st.lon);
             } else if (strcmp(key, "elev") == 0) {
-                p = parse_value_num(p, &st.elev);
+                p = parse_value_num(p, &st.elev_km);
             } else {
                 if (*p == '\'' || *p == '"') {
                     char dummy[256];
@@ -287,9 +279,9 @@ static int stations_load(const char *path, station_cb cb, void *userdata) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+static size_t curl_write_cb(const void *ptr, size_t size, size_t nmemb, void *userdata) {
     buffer_t *buf = (buffer_t *)userdata;
-    size_t total = size * nmemb;
+    const size_t total = size * nmemb;
     char *tmp = realloc(buf->data, buf->size + total + 1);
     if (!tmp)
         return 0;
@@ -307,18 +299,18 @@ static char *fetch_url(const char *url) {
         return NULL;
     buffer_t buf = {NULL, 0};
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    CURLcode res = curl_easy_perform(curl);
+    const CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     if (res != CURLE_OK) {
         debug("fetch: failed (%s)", curl_easy_strerror(res));
         free(buf.data);
         return NULL;
     }
-    debug("fetch: received %zu bytes", buf.size);
+    debug("fetch: received %zu bytes: >>>%s<<<", buf.size, buf.data);
     return buf.data;
 }
 
@@ -344,7 +336,7 @@ static char *xml_attr(xmlNode *node, const char *name) {
 static void append(char *buf, size_t bufsz, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    size_t len = strlen(buf);
+    const size_t len = strlen(buf);
     vsnprintf(buf + len, bufsz - len, fmt, ap);
     va_end(ap);
 }
@@ -557,12 +549,12 @@ static void format_forecast_time(char *out, size_t sz, xmlNode *node) {
         format_time(tf, sizeof(tf), from);
     if (to)
         format_time(tt, sizeof(tt), to);
-    append(out, sz, "%s/%s ", tf, tt);
+    append(out, sz, "%s/%s: ", tf, tt);
 }
 static void format_category(char *out, size_t sz, xmlNode *node) {
-    const char *cat = xml_text(node, "flight_category");
-    if (cat)
-        append(out, sz, "%s; ", cat);
+    const char *category = xml_text(node, "flight_category");
+    if (category)
+        append(out, sz, "%s; ", category);
 }
 static void format_change(char *out, size_t sz, xmlNode *node) {
     const char *change = xml_text(node, "change_indicator");
@@ -576,10 +568,10 @@ static void format_change(char *out, size_t sz, xmlNode *node) {
     }
 }
 static void format_end(char *out, size_t sz) {
+    (void)sz;
     if (strlen(out) > 2)
         if (out[strlen(out) - 1] == ' ' && out[strlen(out) - 2] == ';')
             out[strlen(out) - 2] = '\0';
-    append(out, sz, "\n");
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -682,17 +674,14 @@ static cJSON *process_metar(const char *xml_data, const airport_t *ap, time_t *o
         *out_observed = parse_iso_time(observed);
 
     if (opts.header) {
-        if (ap->name[0]) {
-            char name[MAX_NAME];
-            strncpy(name, ap->name, sizeof(name));
-            name[0] = (char)toupper(name[0]);
-            append(text, sizeof(text), "METAR for %s (%s) issued %s\n", name, ap->icao, timestr);
-        } else {
-            append(text, sizeof(text), "METAR for %s issued %s\n", ap->icao, timestr);
-        }
+        if (ap->name[0])
+            append(text, sizeof(text), "METAR for %s (%s) issued %s", ap->name, ap->icao, timestr);
+        else
+            append(text, sizeof(text), "METAR for %s issued %s", ap->icao, timestr);
     } else {
-        append(text, sizeof(text), "issued %s\n", timestr);
+        append(text, sizeof(text), "issued %s", timestr);
     }
+    append(text, sizeof(text), "; ");
 
     format_wind(text, sizeof(text), metar);
     format_vis(text, sizeof(text), metar);
@@ -745,17 +734,14 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
         format_time(t3, sizeof(t3), valid_to);
 
     if (opts.header) {
-        if (ap->name[0]) {
-            char name[MAX_NAME];
-            strncpy(name, ap->name, sizeof(name));
-            name[0] = (char)toupper(name[0]);
-            append(text, sizeof(text), "TAF for %s (%s) issued %s valid %s to %s\n", name, ap->icao, t1, t2, t3);
-        } else {
-            append(text, sizeof(text), "TAF for %s issued %s valid %s to %s\n", ap->icao, t1, t2, t3);
-        }
+        if (ap->name[0])
+            append(text, sizeof(text), "TAF for %s (%s) issued %s valid %s/%s", ap->name, ap->icao, t1, t2, t3);
+        else
+            append(text, sizeof(text), "TAF for %s issued %s valid %s/%s", ap->icao, t1, t2, t3);
     } else {
-        append(text, sizeof(text), "issued %s valid %s to %s\n", t1, t2, t3);
+        append(text, sizeof(text), "issued %s valid %s/%s", t1, t2, t3);
     }
+    append(text, sizeof(text), "; ");
 
     for (xmlNode *fc = taf->children; fc; fc = fc->next)
         if (fc->type == XML_ELEMENT_NODE && !strcmp((const char *)fc->name, "forecast")) {
@@ -765,8 +751,9 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
             format_vis(text, sizeof(text), fc);
             format_wx(text, sizeof(text), fc);
             format_sky(text, sizeof(text), fc);
-            format_end(text, sizeof(text));
+            // format_end(text, sizeof(text));
         }
+    format_end(text, sizeof(text));
 
     const char *raw = xml_text(taf, "raw_text");
     debug("[%s] TAF raw: %s", ap->icao, raw ? raw : "(none)");
@@ -786,10 +773,10 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
 static void publish_payload(const airport_t *ap, const cJSON *root, const char *suffix) {
-    char *payload = cJSON_PrintUnformatted(root);
     char topic[MAX_TOPIC];
     snprintf(topic, sizeof(topic), "%s/%s%s%s", cfg.topic_prefix, ap->icao, suffix ? "/" : "", suffix ? suffix : "");
     printf("publish: %s to %s\n", ap->icao, topic);
+    char *payload = cJSON_PrintUnformatted(root);
     mosquitto_publish(mosq, NULL, topic, (int)strlen(payload), payload, 0, true);
     free(payload);
 }
@@ -904,7 +891,7 @@ static void fetch_and_publish(airport_t *ap) {
 }
 
 static int should_fetch(const airport_t *ap) {
-    time_t now = time(NULL);
+    const time_t now = time(NULL);
     if (opts.all)
         return (now - ap->last_fetch >= ap->interval * 60);
     int fetch = 0;
@@ -959,7 +946,7 @@ static int config_load(const char *path) {
             cfg.default_interval = v->valueint;
     }
 
-    cJSON *airports = cJSON_GetObjectItem(json, "airports");
+    const cJSON *airports = cJSON_GetObjectItem(json, "airports");
     if (airports && cJSON_IsArray(airports)) {
         cJSON *ap;
         cJSON_ArrayForEach(ap, airports) {
@@ -995,12 +982,10 @@ static void airports_build_json(void) {
             cJSON_AddStringToObject(ap->json, "name", ap->name);
             cJSON_AddNumberToObject(ap->json, "lat", ap->lat);
             cJSON_AddNumberToObject(ap->json, "lon", ap->lon);
-            cJSON_AddNumberToObject(ap->json, "elev_km", ap->elev);
+            cJSON_AddNumberToObject(ap->json, "elev", ap->elev);
         }
         if (ap->country[0])
             cJSON_AddStringToObject(ap->json, "country", ap->country);
-        if (ap->iata[0])
-            cJSON_AddStringToObject(ap->json, "iata", ap->iata);
     }
 }
 static void airports_free(void) {
@@ -1017,10 +1002,9 @@ static void station_match_cb(const station_t *st, void *userdata) {
             debug("[%s] loaded from stations file: '%s'", st->icao, st->name);
             memcpy(ap->name, st->name, sizeof(ap->name));
             memcpy(ap->country, st->country, sizeof(ap->country));
-            memcpy(ap->iata, st->iata, sizeof(ap->iata));
             ap->lat = st->lat;
             ap->lon = st->lon;
-            ap->elev = st->elev;
+            ap->elev = st->elev_km * 1000; // metres
             return;
         }
     }
