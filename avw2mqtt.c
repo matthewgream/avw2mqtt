@@ -24,10 +24,10 @@
 #define MAX_TOPIC 256
 #define MAX_NAME 128
 
-#define LEARN_SAMPLES 5
+#define LEARN_SAMPLES 3
 #define METAR_CAP_MINUTES 35
 #define TAF_CAP_MINUTES 65
-#define SLACK_SECONDS 60
+#define SLACK_SECONDS 120
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -560,12 +560,17 @@ static void format_change(char *out, size_t sz, xmlNode *node) {
     const char *change = xml_text(node, "change_indicator");
     if (change) {
         if (!strcmp(change, "FM"))
-            append(out, sz, "FROM ");
+            append(out, sz, "From ");
         else if (!strcmp(change, "BECMG"))
-            append(out, sz, "BECOMING ");
+            append(out, sz, "Becoming ");
+        else if (!strcmp(change, "PROB"))
+            append(out, sz, "Probable ");
         else
             append(out, sz, "%s ", change);
     }
+    const char *probability = xml_text(node, "probability");
+    if (probability)
+        append(out, sz, "(%d%%) ", atoi(probability));
 }
 static void format_end(char *out, size_t sz) {
     (void)sz;
@@ -577,14 +582,25 @@ static void format_end(char *out, size_t sz) {
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
-static void schedule_add_sample(schedule_t *sched, time_t issued) {
+static void schedule_add_sample(schedule_t *sched, const char *icao, time_t issued) {
     if (issued == 0)
         return;
     if (sched->sample_count >= LEARN_SAMPLES) {
         memmove(&sched->samples[0], &sched->samples[1], (LEARN_SAMPLES - 1) * sizeof(time_t));
         sched->sample_count = LEARN_SAMPLES - 1;
     }
+    debug("[%s] add sample [%d]: %d", icao, sched->sample_count, issued); // XXX
     sched->samples[sched->sample_count++] = issued;
+}
+
+static void schedule_add_missed(schedule_t *sched, const char *icao, const char *type) {
+    if (sched->sample_count > 2) {
+        debug("[%s] %s unexpected timing, reducing samples %d -> 2", icao, type, sched->sample_count);
+        sched->samples[0] = sched->samples[sched->sample_count - 2];
+        sched->samples[1] = sched->samples[sched->sample_count - 1];
+        sched->sample_count = 2;
+    }
+    sched->learned_period = 0;
 }
 
 static void schedule_learn(schedule_t *sched, const char *icao, const char *type, int cap_minutes) {
@@ -599,10 +615,12 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
     }
     if (delta_count == 0)
         return;
-    int min_delta = deltas[0];
-    for (int i = 1; i < delta_count; i++)
-        if (deltas[i] < min_delta)
+    int min_delta = -1;
+    for (int i = 0; i < delta_count; i++) {
+        debug("[%s] delta sample [%d]: %d", icao, i, deltas [i]);
+        if (min_delta == -1 || deltas[i] < min_delta)
             min_delta = deltas[i];
+    }
     int consistent = 1;
     for (int i = 0; i < delta_count; i++) {
         int remainder = deltas[i] % min_delta;
@@ -611,6 +629,7 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
             break;
         }
     }
+    debug("[%s] consistent=%d", icao, consistent);
     if (consistent && sched->sample_count >= LEARN_SAMPLES) {
         sched->learned_period = min_delta;
         debug("[%s] %s learned period: %d seconds (%d minutes)", icao, type, min_delta, min_delta / 60);
@@ -638,16 +657,6 @@ static void schedule_update_next(schedule_t *sched, const char *icao, const char
         sched->next_fetch = now + interval;
         debug("[%s] %s next fetch in %d seconds (default)", icao, type, interval);
     }
-}
-
-static void schedule_missed(schedule_t *sched, const char *icao, const char *type) {
-    if (sched->sample_count > 2) {
-        debug("[%s] %s unexpected timing, reducing samples %d -> 2", icao, type, sched->sample_count);
-        sched->samples[0] = sched->samples[sched->sample_count - 2];
-        sched->samples[1] = sched->samples[sched->sample_count - 1];
-        sched->sample_count = 2;
-    }
-    sched->learned_period = 0;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -839,11 +848,11 @@ static void fetch_and_publish(airport_t *ap) {
                 metar_changed = 1;
             } else if (observed != ap->sched_metar.last_issued) {
                 if (ap->sched_metar.last_issued != 0 && observed < ap->sched_metar.next_fetch - SLACK_SECONDS)
-                    schedule_missed(&ap->sched_metar, ap->icao, "METAR");
+                    schedule_add_missed(&ap->sched_metar, ap->icao, "METAR");
                 metar_changed = 1;
                 debug("[%s] METAR changed: %ld -> %ld", ap->icao, ap->sched_metar.last_issued, observed);
                 if (opts.learn) {
-                    schedule_add_sample(&ap->sched_metar, observed);
+                    schedule_add_sample(&ap->sched_metar, ap->icao, observed);
                     schedule_learn(&ap->sched_metar, ap->icao, "METAR", METAR_CAP_MINUTES);
                 }
                 ap->sched_metar.last_issued = observed;
@@ -868,11 +877,11 @@ static void fetch_and_publish(airport_t *ap) {
                 taf_changed = 1;
             } else if (issued != ap->sched_taf.last_issued) {
                 if (ap->sched_taf.last_issued != 0 && issued < ap->sched_taf.next_fetch - SLACK_SECONDS)
-                    schedule_missed(&ap->sched_taf, ap->icao, "TAF");
+                    schedule_add_missed(&ap->sched_taf, ap->icao, "TAF");
                 taf_changed = 1;
                 debug("[%s] TAF changed: %ld -> %ld", ap->icao, ap->sched_taf.last_issued, issued);
                 if (opts.learn) {
-                    schedule_add_sample(&ap->sched_taf, issued);
+                    schedule_add_sample(&ap->sched_taf, ap->icao, issued);
                     schedule_learn(&ap->sched_taf, ap->icao, "TAF", TAF_CAP_MINUTES);
                 }
                 ap->sched_taf.last_issued = issued;
