@@ -6,7 +6,7 @@ Requires=mosquitto.service
 
 [Service]
 Type=simple
-ExecStart=/opt/avw2mqtt/avw2mqtt --config /opt/avw2mqtt/avw2mqtt.conf
+ExecStart=/opt/avw2mqtt/avw2mqtt --split --learn --config /opt/avw2mqtt/avw2mqtt.conf
 TimeoutStopSec=15s
 KillMode=mixed
 Restart=on-failure
