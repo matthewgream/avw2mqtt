@@ -27,7 +27,7 @@
 #define LEARN_SAMPLES 3
 #define METAR_CAP_MINUTES 35
 #define TAF_CAP_MINUTES 65
-#define SLACK_SECONDS 120
+#define SLACK_SECONDS (5 * 60)
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
@@ -94,12 +94,21 @@ static options_t opts = {0, 0, 0, 1, 0, "avw2mqtt.conf"};
 // -----------------------------------------------------------------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------------------------------------------------------------
 
+static const char *timestamp_to_str(const time_t t) {
+    static char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+    return timestamp;
+}
+
 static void debug(const char *fmt, ...) {
     if (!opts.debug)
         return;
+    const time_t now = time(NULL);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[debug] ");
+    fprintf(stderr, "[%s] [debug] ", timestamp);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -589,7 +598,7 @@ static void schedule_add_sample(schedule_t *sched, const char *icao, time_t issu
         memmove(&sched->samples[0], &sched->samples[1], (LEARN_SAMPLES - 1) * sizeof(time_t));
         sched->sample_count = LEARN_SAMPLES - 1;
     }
-    debug("[%s] add sample [%d]: %d", icao, sched->sample_count, issued); // XXX
+    debug("[%s] add sample [%d]: %ld (%s)", icao, sched->sample_count, issued, timestamp_to_str(issued)); // XXX
     sched->samples[sched->sample_count++] = issued;
 }
 
@@ -617,7 +626,7 @@ static void schedule_learn(schedule_t *sched, const char *icao, const char *type
         return;
     int min_delta = -1;
     for (int i = 0; i < delta_count; i++) {
-        debug("[%s] delta sample [%d]: %d", icao, i, deltas [i]);
+        debug("[%s] delta sample [%d]: %d", icao, i, deltas[i]);
         if (min_delta == -1 || deltas[i] < min_delta)
             min_delta = deltas[i];
     }
@@ -648,7 +657,7 @@ static void schedule_update_next(schedule_t *sched, const char *icao, const char
         while (next <= now)
             next += sched->learned_period;
         sched->next_fetch = next + SLACK_SECONDS;
-        debug("[%s] %s next fetch at %ld (in %ld seconds)", icao, type, sched->next_fetch, sched->next_fetch - now);
+        debug("[%s] %s next fetch at %ld (%s) (in %ld seconds)", icao, type, sched->next_fetch, timestamp_to_str(sched->next_fetch), sched->next_fetch - now);
     } else {
         const int cap = cap_minutes * 60;
         int interval = default_interval * 60;
@@ -794,7 +803,7 @@ static cJSON *process_taf(const char *xml_data, const airport_t *ap, time_t *out
 static void publish_payload(const airport_t *ap, const cJSON *root, const char *suffix) {
     char topic[MAX_TOPIC];
     snprintf(topic, sizeof(topic), "%s/%s%s%s", cfg.topic_prefix, ap->icao, suffix ? "/" : "", suffix ? suffix : "");
-    printf("publish: %s to %s\n", ap->icao, topic);
+    debug("publish: %s to %s\n", ap->icao, topic);
     char *payload = cJSON_PrintUnformatted(root);
     mosquitto_publish(mosq, NULL, topic, (int)strlen(payload), payload, 0, true);
     free(payload);
@@ -835,7 +844,7 @@ static void fetch_and_publish(airport_t *ap) {
     int metar_changed = 0, taf_changed = 0;
     time_t observed = 0, issued = 0;
 
-    if (ap->fetch_metar) {
+    if (ap->fetch_metar && (ap->sched_metar.next_fetch == 0 || now >= ap->sched_metar.next_fetch)) {
         char url[MAX_URL];
         snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/metar?format=xml&taf=false&ids=%s", ap->icao);
         char *xml = fetch_url(url);
@@ -864,7 +873,7 @@ static void fetch_and_publish(airport_t *ap) {
         }
     }
 
-    if (ap->fetch_taf) {
+    if (ap->fetch_taf && (ap->sched_taf.next_fetch == 0 || now >= ap->sched_taf.next_fetch)) {
         char url[MAX_URL];
         snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/taf?format=xml&ids=%s", ap->icao);
         char *xml = fetch_url(url);
@@ -913,14 +922,11 @@ static int should_fetch(const airport_t *ap) {
     const time_t now = time(NULL);
     if (opts.all)
         return (now - ap->last_fetch >= ap->interval * 60);
-    int fetch = 0;
-    if (ap->fetch_metar)
-        if (ap->sched_metar.next_fetch == 0 || now >= ap->sched_metar.next_fetch)
-            fetch = 1;
-    if (ap->fetch_taf)
-        if (ap->sched_taf.next_fetch == 0 || now >= ap->sched_taf.next_fetch)
-            fetch = 1;
-    return fetch;
+    if (ap->fetch_metar && (ap->sched_metar.next_fetch == 0 || now >= ap->sched_metar.next_fetch))
+        return 1;
+    if (ap->fetch_taf && (ap->sched_taf.next_fetch == 0 || now >= ap->sched_taf.next_fetch))
+        return 1;
+    return 0;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------------------
